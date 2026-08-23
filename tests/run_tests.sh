@@ -124,6 +124,29 @@ CA=$(echo '{}' | "$PACK" closeout --cli agy)
 echo "$CA" | grep -q '"continue"' && ok "agy Stop blocks with continue" || bad "agy no continue"
 rm -f .ctxpack/blocked_once
 
+echo "== T18 cross-CLI tail: claude transcript injected =="
+export CLH="$TMP/fakehome"
+ENC="-$(echo "$FIX" | sed 's|^/||; s|/|-|g; s|\.|-|g')"; mkdir -p "$CLH/.claude/projects/$ENC"
+FCL="$(ls -t ~/.claude/projects 2>/dev/null | head -1)"
+python3 - "$CLH" "$FIX" <<'PY'
+import json, os, sys, time
+home, fix = sys.argv[1], sys.argv[2]
+enc = "-" + fix.strip("/").replace("/", "-").replace(".", "-")
+d = os.path.join(home, ".claude", "projects", enc)
+os.makedirs(d, exist_ok=True)
+rec = {"type": "assistant", "message": {"content": [{"type": "text", "text": "MARKER_CLAUDE_TAIL 已完成登录重构"}]}}
+with open(os.path.join(d, "s1.jsonl"), "w") as f:
+    f.write(json.dumps(rec) + "\n")
+os.utime(os.path.join(d, "s1.jsonl"), (time.time(), time.time()))
+PY
+OUTT=$(CTXPACK_HOME="$CLH" echo '{}' | CTXPACK_HOME="$CLH" "$PACK" inject --cli gemini)
+echo "$OUTT" | grep -q "Other agents" && ok "tail section present" || bad "no Other agents section"
+echo "$OUTT" | grep -q "MARKER_CLAUDE_TAIL" && ok "claude tail text carried" || bad "tail text missing"
+
+echo "== T19 self-exclusion: claude inject skips claude tail =="
+CTXPACK_HOME="$CLH" echo '{}' | CTXPACK_HOME="$CLH" "$PACK" inject --cli claude | grep -q "Other agents" && bad "self tail leaked" || ok "own CLI tail excluded"
+
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 rm -rf "$TMP"

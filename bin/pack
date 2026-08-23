@@ -19,8 +19,9 @@ import re
 import subprocess
 import sys
 import time
+import glob as _glob
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 BUDGET_DEFAULT = 1200
 MAIL_MAX_BYTES = 2048
 CTXDIR = ".ctxpack"
@@ -51,6 +52,12 @@ def find_root():
     paths = STDIN_DATA.get("workspacePaths") or []
     if paths and os.path.isdir(paths[0]):
         d = paths[0]
+    elif not paths:
+        # agy -p sends empty workspacePaths and a sanitized env (PWD=config dir).
+        # Headless automation should export CTXPACK_WORKSPACE=<project>.
+        ws = os.environ.get("CTXPACK_WORKSPACE", "")
+        if ws and os.path.isdir(ws):
+            d = ws
     while True:
         for marker in ("AGENTS.md", ".git"):
             if os.path.exists(os.path.join(d, marker)):
@@ -178,9 +185,133 @@ def mailbox_msgs(root):
     return msgs
 
 
+
+MAX_TAIL_AGE_DAYS = 14
+TAIL_CHARS = 220
+
+
+def _read_tail_lines(path, nbytes=60000):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > nbytes:
+                f.seek(size - nbytes)
+                f.readline()  # drop partial line
+            data = f.read().decode("utf-8", errors="replace")
+        return [l for l in data.splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def _human_ago(ts):
+    s = max(0, int(time.time() - ts))
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _project_dir_candidates(root):
+    """macOS /var -> /private/var symlinks make getcwd differ from $PWD."""
+    out = []
+    for r in dict.fromkeys([root, os.environ.get("PWD") or "", os.path.realpath(root)]):
+        out.append("-" + r.strip("/").replace("/", "-").replace(".", "-"))
+    return out
+
+
+def _claude_tail(home, root, current_cli):
+    if current_cli == "claude":
+        return None
+    d = None
+    for enc in _project_dir_candidates(root):
+        p = os.path.join(home, ".claude", "projects", enc)
+        if os.path.isdir(p):
+            d = p
+            break
+    if not d:
+        return None
+    files = [f for f in _glob.glob(os.path.join(d, "*.jsonl"))
+             if time.time() - os.path.getmtime(f) < MAX_TAIL_AGE_DAYS * 86400]
+    if not files:
+        return None
+    path = max(files, key=os.path.getmtime)
+    for line in reversed(_read_tail_lines(path)):
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("type") != "assistant":
+            continue
+        c = (e.get("message") or {}).get("content")
+        if isinstance(c, list):
+            txt = " ".join(x.get("text", "") for x in c if isinstance(x, dict)).strip()
+        elif isinstance(c, str):
+            txt = c.strip()
+        else:
+            txt = ""
+        if txt:
+            return {"cli": "claude", "ts": os.path.getmtime(path), "text": txt[:TAIL_CHARS]}
+    return None
+
+
+def _codex_tail(home, root, current_cli):
+    if current_cli == "codex":
+        return None
+    base = os.path.join(home, ".codex", "sessions")
+    if not os.path.isdir(base):
+        return None
+    best = None
+    for f in _glob.glob(os.path.join(base, "**", "rollout-*.jsonl"), recursive=True):
+        mt = os.path.getmtime(f)
+        if time.time() - mt > MAX_TAIL_AGE_DAYS * 86400:
+            continue
+        if best is None or mt > best[0]:
+            best = (mt, f)
+    if not best:
+        return None
+    mt, path = best
+    meta_cwd = None
+    lines = _read_tail_lines(path)
+    try:
+        first = json.loads(lines[0])
+        if first.get("type") == "session_meta":
+            meta_cwd = (first.get("payload") or {}).get("cwd")
+    except Exception:
+        pass
+    if meta_cwd and os.path.normpath(os.path.realpath(meta_cwd)) !=             os.path.normpath(os.path.realpath(root)):
+        return None
+    for line in reversed(lines[1:] if lines else []):
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        p = e.get("payload") or {}
+        if p.get("type") == "message" and p.get("role") == "assistant":
+            txt = " ".join(c.get("text", "") for c in p.get("content") or []
+                           if isinstance(c, dict)).strip()
+            if txt:
+                return {"cli": "codex", "ts": mt, "text": txt[:TAIL_CHARS]}
+    return None
+
+
+def transcript_tails(root, current_cli):
+    """Last known words from OTHER CLIs on this workspace (ctx-style)."""
+    home = os.environ.get("CTXPACK_HOME") or os.path.expanduser("~")
+    out = []
+    for fn in (_claude_tail, _codex_tail):
+        try:
+            r = fn(home, root, current_cli)
+        except Exception:
+            r = None
+        if r and r["text"]:
+            out.append(r)
+    return sorted(out, key=lambda x: -x["ts"])
+
+
 # ---------- pack compiler ----------
 
-def build_sections(root, budget, state):
+def build_sections(root, budget, state, current_cli=None):
     sections = []  # (prio, pinned, name, body)
 
     def add(prio, pinned, name, body):
@@ -213,13 +344,19 @@ def build_sections(root, budget, state):
         lines += [f"- {m.get('from', '?')}: {str(m.get('msg', ''))[:120]}" for m in unread[-3:]]
         add(3, False, "Mailbox", "\n".join(lines))
 
+    others = transcript_tails(root, current_cli=current_cli)
+    if others:
+        olines = [f"- {o['cli']} · {_human_ago(o['ts'])}: {o['text']}" for o in others]
+        add(4, False, "Other agents' last words (cross-CLI handoff)",
+            "\n".join(olines))
+
     facts = check_freshness(root, parse_facts(root))
     fresh = [f for f in facts if f["ok"]]
     stale = [f for f in facts if not f["ok"]]
     flines = [f"- OK  {f['text']} ({f['ev']})" for f in fresh]
     flines += [f"- STALE {f['text']} ({f['warn']} — verify before trusting)" for f in stale]
     if flines:
-        add(4, False, "Facts (evidence-checked against git)", "\n".join(flines))
+        add(5, False, "Facts (evidence-checked against git)", "\n".join(flines))
 
     kept, dropped, used = [], [], est_tokens(header)
     for s in sorted(sections, key=lambda x: x["prio"]):
@@ -259,7 +396,7 @@ def cmd_inject(args):
     budget = args.budget or BUDGET_DEFAULT
     t0 = time.time()
     state = load_state(root)
-    header, kept, used, dropped, why, counts = build_sections(root, budget, state)
+    header, kept, used, dropped, why, counts = build_sections(root, budget, state, current_cli=args.cli)
     sm = (f"ctxpack: {used}/{budget} tok · "
           f"{counts['fresh']} facts ({counts['stale']} stale) · "
           f"{counts['unread']} unread · {len(dropped)} dropped")
@@ -275,10 +412,14 @@ def cmd_inject(args):
             "systemMessage": sm,
         }
     hp = os.path.join(root, "docs/agent/HANDOFF.md")
+    current_hm = os.path.getmtime(hp) if os.path.exists(hp) else 0
+    saved_hm = state.get("handoff_mtime")
+    if saved_hm is None or state.get("head") != git(root, "rev-parse", "HEAD"):
+        saved_hm = current_hm
     save_state(root, {
         **state,
         "head": git(root, "rev-parse", "HEAD"),
-        "handoff_mtime": os.path.getmtime(hp) if os.path.exists(hp) else 0,
+        "handoff_mtime": saved_hm,
         "ts": time.time(),
     })
     blocked = os.path.join(root, CTXDIR, "blocked_once")
@@ -295,8 +436,15 @@ def cmd_closeout(args):
     allow = lambda: json.dump({}, sys.stdout)
 
     dirty_raw = git(root, "status", "--porcelain")
-    dirty = [l[3:] for l in (dirty_raw or "").splitlines()
-             if l.strip() and CTXDIR not in l]
+    dirty = []
+    for l in (dirty_raw or "").splitlines():
+        l = l.strip()
+        if not l or CTXDIR in l:
+            continue
+        rel = l[2:].strip()
+        if " -> " in rel:
+            rel = rel.split(" -> ")[-1].strip()
+        dirty.append(rel)
     state = load_state(root)
     blocked_flag = os.path.join(root, CTXDIR, "blocked_once")
 
@@ -306,7 +454,9 @@ def cmd_closeout(args):
         return
     hp = os.path.join(root, "docs/agent/HANDOFF.md")
     h_mtime = os.path.getmtime(hp) if os.path.exists(hp) else 0
-    if h_mtime > state.get("handoff_mtime", 0):
+    dirty_others = [os.path.join(root, rel) for rel in dirty if rel != "docs/agent/HANDOFF.md" and os.path.exists(os.path.join(root, rel))]
+    latest_other = max([os.path.getmtime(p) for p in dirty_others], default=0)
+    if h_mtime >= latest_other and (h_mtime > state.get("handoff_mtime", 0) or "docs/agent/HANDOFF.md" in dirty):
         log_event(root, {"event": "closeout_pass", "cli": args.cli, "dirty": len(dirty)})
         allow()
         return

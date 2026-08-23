@@ -32,6 +32,7 @@ bin/pack            全部逻辑(单文件,零依赖 Python3)
   closeout --cli …  Stop/AfterAgent:改码未写 HANDOFF 则 block
   facts-check       FACTS.md 新鲜度报告
   say/mail-read     跨 CLI 邮箱(<2KB/条,append-only)
+  (inject 内置)    跨 CLI transcript 尾部:自动附带其他 CLI 最近发言
   doctor            健康检查(hook 接线/STALE/占用冲突/未读)
   log               观测日志(.ctxpack/events.jsonl)
 docs/agent/         HANDOFF(短命)/ FACTS(带证据长寿)/ DECISIONS(pinned)/ STATUS / MAILBOX.jsonl
