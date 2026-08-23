@@ -347,7 +347,9 @@ def build_sections(root, budget, state, current_cli=None):
     others = transcript_tails(root, current_cli=current_cli)
     if others:
         olines = [f"- {o['cli']} · {_human_ago(o['ts'])}: {o['text']}" for o in others]
-        add(4, False, "Other agents' last words (cross-CLI handoff)",
+        add(4, False,
+            "Other agents' last words (FYI only — do NOT resume their work "
+            "unless the user explicitly asks)",
             "\n".join(olines))
 
     facts = check_freshness(root, parse_facts(root))
