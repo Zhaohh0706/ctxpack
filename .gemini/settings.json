@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "ctxpack-inject",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.ctxpack/pack inject --cli gemini"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "ctxpack-closeout",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.ctxpack/pack closeout --cli gemini"
+          }
+        ]
+      }
+    ]
+  }
+}

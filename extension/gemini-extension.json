@@ -1,0 +1,5 @@
+{
+  "name": "ctxpack",
+  "version": "0.2.0",
+  "description": "Cross-CLI context pack compiler: injects a fresh, evidence-checked context bundle at SessionStart; enforces handoff closeout at AfterAgent."
+}

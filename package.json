@@ -1,0 +1,31 @@
+{
+  "name": "ctxpack",
+  "version": "0.2.0",
+  "description": "Cross-CLI context pack compiler: forced, budgeted, evidence-checked context injection for Gemini/Claude/Codex hooks",
+  "license": "MIT",
+  "bin": {
+    "ctxpack": "bin/pack"
+  },
+  "files": [
+    "bin/",
+    "templates/",
+    "scripts/install.sh",
+    "extension/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "scripts": {
+    "test": "tests/run_tests.sh"
+  },
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "gemini-cli",
+    "codex",
+    "hooks",
+    "context-engineering",
+    "agent-memory"
+  ]
+}

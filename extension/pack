@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""ctxpack — cross-CLI context pack compiler. v0.2
+
+Subcommands:
+  inject     --cli gemini|claude|codex [--budget N]   SessionStart: emit envelope JSON
+  closeout   --cli gemini|claude|codex                Stop/AfterAgent: block if code changed, HANDOFF not updated
+  facts-check                                         FACTS.md freshness report
+  say        --from ID --msg TEXT                     append to MAILBOX.jsonl (<2KB)
+  mail-read                                           mark mailbox as read
+  doctor                                              health check (hooks, facts, mailbox, occupancy)
+  log        [--tail N]                               show event log
+  version                                             print version
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+VERSION = "0.2.0"
+BUDGET_DEFAULT = 1200
+MAIL_MAX_BYTES = 2048
+CTXDIR = ".ctxpack"
+FACT_RE = re.compile(r"^\s*-\s+(?P<text>.+?)\s*\((?P<path>[^@\s()]+)@(?P<sha>[0-9a-f]{7,40})\)\s*$")
+OCC_RE = re.compile(r"^\s*-\s+(?P<wt>\S+):\s+(?P<who>\S+)\s+(?P<what>.+)$")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def find_root():
+    d = os.getcwd()
+    while True:
+        for marker in ("AGENTS.md", ".git"):
+            if os.path.exists(os.path.join(d, marker)):
+                return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.getcwd()
+        d = parent
+
+
+def read(path, root, limit=None):
+    p = os.path.join(root, path)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8", errors="replace") as f:
+        t = f.read()
+    return t[:limit] if limit else t
+
+
+def git(root, *args):
+    try:
+        r = subprocess.run(["git", "-C", root] + list(args),
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def est_tokens(s):
+    cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff")
+    return int(cjk * 1.05 + (len(s) - cjk) / 3.8) + 1
+
+
+# ---------- storage ----------
+
+def ctx_dir(root):
+    d = os.path.join(root, CTXDIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def save_state(root, state):
+    with open(os.path.join(ctx_dir(root), "state.json"), "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def load_state(root):
+    try:
+        with open(os.path.join(root, CTXDIR, "state.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def log_event(root, rec):
+    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    with open(os.path.join(ctx_dir(root), "events.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ---------- parsing ----------
+
+def parse_facts(root):
+    raw = read("docs/agent/FACTS.md", root)
+    if not raw:
+        return []
+    out = []
+    for line in raw.splitlines():
+        m = FACT_RE.match(line)
+        if m:
+            out.append({"text": m.group("text"), "path": m.group("path"),
+                        "sha": m.group("sha")[:12]})
+    return out
+
+
+def check_freshness(root, facts):
+    head = git(root, "rev-parse", "HEAD")
+    for f in facts:
+        cur = git(root, "log", "-1", "--format=%H", "--", f["path"])
+        f["ev"] = f"{f['path']}@{f['sha'][:7]}"
+        if head is None:
+            f["ok"], f["warn"] = True, "unverified (no commits)"
+        elif cur is None:
+            f["ok"], f["warn"] = False, "STALE: file missing"
+        elif not cur.startswith(f["sha"]):
+            f["ok"], f["warn"] = False, f"STALE: {f['path']} changed since {f['sha'][:7]}"
+        else:
+            f["ok"], f["warn"] = True, None
+    return facts
+
+
+def parse_occupancy(root):
+    raw = read("docs/agent/STATUS.md", root)
+    if not raw:
+        return []
+    rows = []
+    for l in raw.splitlines():
+        m = OCC_RE.match(l.strip())
+        if m and m.group("wt").startswith((".", "/")):
+            rows.append({"worktree": m.group("wt"), "who": m.group("who"),
+                         "what": m.group("what").strip()})
+    return rows
+
+
+def mailbox_msgs(root):
+    p = os.path.join(root, "docs/agent/MAILBOX.jsonl")
+    if not os.path.exists(p):
+        return []
+    msgs = []
+    with open(p, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    msgs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return msgs
+
+
+# ---------- pack compiler ----------
+
+def build_sections(root, budget, state):
+    sections = []  # (prio, pinned, name, body)
+
+    def add(prio, pinned, name, body):
+        if body:
+            sections.append({"prio": prio, "pinned": pinned, "name": name, "body": body})
+
+    handoff = read("docs/agent/HANDOFF.md", root, limit=1500)
+    add(0, True, "Handoff", handoff.strip() if handoff else None)
+
+    decisions = read("docs/agent/DECISIONS.md", root, limit=800)
+    body = "\n".join(l for l in (decisions or "").splitlines()
+                     if l.strip() and not l.strip().startswith("<!--"))
+    # Constraint Pinning (arXiv 2606.22528): standing constraints are re-injected
+    # every SessionStart and never dropped for budget.
+    add(1, True, "Pinned constraints", body)
+
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD") or "?"
+    header = f"[ctxpack v{VERSION}] project context · branch {branch}"
+
+    occ = parse_occupancy(root)
+    active = [o for o in occ if re.search(r"working|claimed|\bfix\b|\bfeat\b", o["what"], re.I)]
+    if active:
+        add(2, False, "Occupancy (do not touch others' worktrees)",
+            "\n".join(f"- {o['worktree']}: {o['who']} — {o['what']}" for o in active))
+
+    last_read = _ts(str(state.get("last_mail_read_ts", "")))
+    unread = [m for m in mailbox_msgs(root) if _ts(m.get("ts", "")) > last_read]
+    if unread:
+        lines = [f"unread: {len(unread)}"]
+        lines += [f"- {m.get('from', '?')}: {str(m.get('msg', ''))[:120]}" for m in unread[-3:]]
+        add(3, False, "Mailbox", "\n".join(lines))
+
+    facts = check_freshness(root, parse_facts(root))
+    fresh = [f for f in facts if f["ok"]]
+    stale = [f for f in facts if not f["ok"]]
+    flines = [f"- OK  {f['text']} ({f['ev']})" for f in fresh]
+    flines += [f"- STALE {f['text']} ({f['warn']} — verify before trusting)" for f in stale]
+    if flines:
+        add(4, False, "Facts (evidence-checked against git)", "\n".join(flines))
+
+    kept, dropped, used = [], [], est_tokens(header)
+    for s in sorted(sections, key=lambda x: x["prio"]):
+        t = est_tokens(s["body"])
+        if s["pinned"]:
+            kept.append(s)
+            used += t
+        elif used + t <= budget - 60:
+            kept.append(s)
+            used += t
+        else:
+            dropped.append({"section": s["name"], "est_tokens": t})
+    why = [f"{s['name'].lower()} included" + (" (pinned)" if s["pinned"] else "")
+           for s in kept]
+    counts = {"fresh": len(fresh), "stale": len(stale), "unread": len(unread)}
+    return header, kept, used, dropped, why, counts
+
+
+def _ts(s):
+    try:
+        return time.mktime(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0
+
+
+def render_context(header, kept):
+    parts = [header]
+    for s in kept:
+        parts.append(f"\n## {s['name']}\n{s['body']}")
+    return "\n".join(parts)
+
+
+# ---------- commands ----------
+
+def cmd_inject(args):
+    root = find_root()
+    try:
+        json.load(sys.stdin)
+    except Exception:
+        pass
+    budget = args.budget or BUDGET_DEFAULT
+    t0 = time.time()
+    state = load_state(root)
+    header, kept, used, dropped, why, counts = build_sections(root, budget, state)
+    env = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": render_context(header, kept),
+        },
+        "systemMessage": (f"ctxpack: {used}/{budget} tok · "
+                          f"{counts['fresh']} facts ({counts['stale']} stale) · "
+                          f"{counts['unread']} unread · {len(dropped)} dropped"),
+    }
+    hp = os.path.join(root, "docs/agent/HANDOFF.md")
+    save_state(root, {
+        **state,
+        "head": git(root, "rev-parse", "HEAD"),
+        "handoff_mtime": os.path.getmtime(hp) if os.path.exists(hp) else 0,
+        "ts": time.time(),
+    })
+    blocked = os.path.join(root, CTXDIR, "blocked_once")
+    if os.path.exists(blocked):
+        os.remove(blocked)
+    log_event(root, {"event": "inject", "cli": args.cli, "used": used,
+                     "budget": budget, **counts, "dropped": dropped,
+                     "why": why, "ms": int((time.time() - t0) * 1000)})
+    json.dump(env, sys.stdout, ensure_ascii=False)
+
+
+def cmd_closeout(args):
+    root = find_root()
+    try:
+        json.load(sys.stdin)
+    except Exception:
+        pass
+    allow = lambda: json.dump({}, sys.stdout)
+
+    dirty_raw = git(root, "status", "--porcelain")
+    dirty = [l[3:] for l in (dirty_raw or "").splitlines()
+             if l.strip() and CTXDIR not in l]
+    state = load_state(root)
+    blocked_flag = os.path.join(root, CTXDIR, "blocked_once")
+
+    if not dirty:
+        allow()
+        return
+    hp = os.path.join(root, "docs/agent/HANDOFF.md")
+    h_mtime = os.path.getmtime(hp) if os.path.exists(hp) else 0
+    if h_mtime > state.get("handoff_mtime", 0):
+        log_event(root, {"event": "closeout_pass", "cli": args.cli, "dirty": len(dirty)})
+        allow()
+        return
+    if os.path.exists(blocked_flag):
+        allow()
+        return
+    open(blocked_flag, "w").close()
+    reason = ("ctxpack closeout: you modified files without updating "
+              "docs/agent/HANDOFF.md. Write the handoff for the next session "
+              "(what was done, what is broken, next step), then finish.")
+    log_event(root, {"event": "closeout_block", "cli": args.cli, "dirty": len(dirty)})
+    if args.cli == "gemini":
+        json.dump({"decision": "deny", "reason": reason}, sys.stdout)
+    else:
+        json.dump({"decision": "block", "reason": reason}, sys.stdout)
+
+
+def cmd_facts_check(args):
+    root = find_root()
+    facts = check_freshness(root, parse_facts(root))
+    if not facts:
+        print("no parsable facts in docs/agent/FACTS.md")
+        return
+    for f in facts:
+        mark = "OK    " if f["ok"] else "STALE "
+        extra = f"  [{f['warn']}]" if f.get("warn") else ""
+        print(f"{mark}{f['text']}  ({f['ev']}){extra}")
+
+
+def cmd_say(args):
+    root = find_root()
+    msg = {"from": args.sender, "msg": args.msg,
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    blob = json.dumps(msg, ensure_ascii=False).encode()
+    if len(blob) > MAIL_MAX_BYTES:
+        die(f"message too large: {len(blob)} bytes (limit {MAIL_MAX_BYTES})")
+    p = os.path.join(root, "docs/agent/MAILBOX.jsonl")
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(blob.decode() + "\n")
+    print(f"delivered to {os.path.relpath(p, root)}")
+
+
+def cmd_mail_read(args):
+    root = find_root()
+    save_state(root, {**load_state(root),
+                      "last_mail_read_ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    print("mailbox marked read")
+
+
+def cmd_doctor(args):
+    root = find_root()
+    errors, warns = [], []
+
+    if not os.path.exists(os.path.join(root, "AGENTS.md")):
+        errors.append("AGENTS.md missing at project root")
+    if git(root, "rev-parse", "HEAD") is None and not os.path.isdir(os.path.join(root, ".git")):
+        warns.append("not a git repo — freshness checks degraded to unverified")
+    for cli, cfg in (("gemini", ".gemini/settings.json"), ("claude", ".claude/settings.json")):
+        p = os.path.join(root, cfg)
+        if not os.path.exists(p):
+            warns.append(f"{cli} hooks not wired ({cfg} missing) — run scripts/install.sh")
+        else:
+            txt = open(p, encoding="utf-8").read()
+            if "ctxpack" not in txt:
+                warns.append(f"{cli} settings exist but no ctxpack hook")
+    facts = check_freshness(root, parse_facts(root))
+    stale = [f for f in facts if not f["ok"]]
+    if stale:
+        warns.append(f"{len(stale)}/{len(facts)} facts STALE — run `pack facts-check`")
+    unread = len(mailbox_msgs(root))
+    if unread:
+        warns.append(f"mailbox has {unread} message(s) unread")
+    occ = parse_occupancy(root)
+    seen_wt = {}
+    for o in occ:
+        key = os.path.normpath(o["worktree"])
+        if key in seen_wt:
+            errors.append(f"occupancy conflict on {o['worktree']}: "
+                          f"{seen_wt[key]} vs {o['who']}")
+        seen_wt[key] = o["who"]
+    dirty = [l for l in (git(root, "status", "--porcelain") or "").splitlines()
+             if l.strip() and CTXDIR not in l]
+    if dirty:
+        warns.append(f"{len(dirty)} uncommitted file(s)")
+    ev_p = os.path.join(root, CTXDIR, "events.jsonl")
+    if not os.path.exists(ev_p):
+        warns.append("no injection events yet — hook may not be firing")
+    hp = os.path.join(root, "docs/agent/HANDOFF.md")
+    if os.path.exists(hp):
+        age_d = (time.time() - os.path.getmtime(hp)) / 86400
+        if age_d > 7:
+            warns.append(f"HANDOFF.md untouched for {age_d:.0f} days")
+
+    print(f"ctxpack doctor @ {root}")
+    for e in errors:
+        print(f"  ERROR  {e}")
+    for w in warns:
+        print(f"  WARN   {w}")
+    if not errors and not warns:
+        print("  all clear")
+    print(f"  facts {len(facts) - len(stale)}/{len(facts)} fresh · "
+          f"occupancy {len(occ)} · mailbox {unread} · events {'yes' if os.path.exists(ev_p) else 'no'}")
+    sys.exit(1 if errors else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pack")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p1 = sub.add_parser("inject")
+    p1.add_argument("--cli", required=True, choices=["gemini", "claude", "codex"])
+    p1.add_argument("--budget", type=int, default=BUDGET_DEFAULT)
+    p2 = sub.add_parser("closeout")
+    p2.add_argument("--cli", required=True, choices=["gemini", "claude", "codex"])
+    sub.add_parser("facts-check")
+    p4 = sub.add_parser("say")
+    p4.add_argument("--from", dest="sender", required=True)
+    p4.add_argument("--msg", required=True)
+    sub.add_parser("mail-read")
+    sub.add_parser("doctor")
+    p7 = sub.add_parser("log")
+    p7.add_argument("--tail", type=int, default=20)
+    sub.add_parser("version")
+    args = ap.parse_args()
+    {"inject": cmd_inject, "closeout": cmd_closeout, "facts-check": cmd_facts_check,
+     "say": cmd_say, "mail-read": cmd_mail_read, "doctor": cmd_doctor,
+     "log": cmd_log, "version": lambda a: print(f"ctxpack pack v{VERSION}")}[args.cmd](args)
+
+
+def cmd_log(args):
+    root = find_root()
+    p = os.path.join(root, CTXDIR, "events.jsonl")
+    if not os.path.exists(p):
+        print("no events yet")
+        return
+    with open(p, encoding="utf-8") as f:
+        lines = f.readlines()
+    for l in lines[-args.tail:]:
+        print(l.rstrip())
+
+
+if __name__ == "__main__":
+    main()
