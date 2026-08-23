@@ -29,10 +29,7 @@ for f in AGENTS.md HANDOFF.md DECISIONS.md STATUS.md FACTS.md; do
 done
 [ -e "$P/GEMINI.md" ] || ln -s AGENTS.md "$P/GEMINI.md"
 
-if $WITH_AGY; then
-  mkdir -p "$HOME/.ctxpack"
-  cp "$SRC/bin/pack" "$HOME/.ctxpack/pack" && chmod +x "$HOME/.ctxpack/pack"
-fi
+
 
 python3 - "$P" "$WITH_CLAUDE" "$WITH_AGY" <<'PYEOF'
 import json, os, shutil, sys
@@ -83,17 +80,17 @@ if with_claude:
     print("    wired .claude/settings.json (SessionStart + Stop)")
 
 if with_agy:
-    hp = os.path.expanduser("~/.gemini/config/hooks.json")
+    hp = os.path.join(p, ".agents/hooks.json")
     agy = load(hp)
     def push_flat(name, event, command):
         h = agy.setdefault(name, {})
         lst = h.setdefault(event, [])
         if not any(c.get("command") == command for c in lst):
             lst.append({"type": "command", "command": command, "timeout": 15})
-    push_flat("ctxpack-inject", "PreInvocation", "~/.ctxpack/pack inject --cli agy")
-    push_flat("ctxpack-closeout", "Stop", "~/.ctxpack/pack closeout --cli agy")
+    push_flat("ctxpack-inject", "PreInvocation", "../.ctxpack/pack inject --cli agy")
+    push_flat("ctxpack-closeout", "Stop", "../.ctxpack/pack closeout --cli agy")
     save(hp, agy)
-    print("    wired ~/.gemini/config/hooks.json (PreInvocation + Stop, user-level)")
+    print("    wired .agents/hooks.json (PreInvocation + Stop, project-level)")
 
 codex_hint = ("merge .ctxpack/codex-snippet.json into ~/.codex/hooks.json (manual, P2)")
 open(os.path.join(p, ".ctxpack/codex-snippet.json"), "w").write(json.dumps({

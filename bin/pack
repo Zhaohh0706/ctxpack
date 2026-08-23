@@ -301,6 +301,7 @@ def cmd_closeout(args):
     blocked_flag = os.path.join(root, CTXDIR, "blocked_once")
 
     if not dirty:
+        log_event(root, {"event": "closeout_allow_clean", "cli": args.cli})
         allow()
         return
     hp = os.path.join(root, "docs/agent/HANDOFF.md")

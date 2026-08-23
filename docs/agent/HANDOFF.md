@@ -2,8 +2,6 @@
 
 ## Current
 
-- 项目:ctxpack v0.3.0(跨 CLI 上下文编译器)。研究结论在 docs/research/。
-- v0.3.0 新增:Antigravity CLI(agy)完整接入——PreInvocation 每轮注入 + Stop closeout,schema 经二进制内嵌文档+真机逆向验证(hook-matrix.md)。
-- 真机已验证:agy -p 下注入生效(模型可见 [ctxpack] 内容);Stop 仅交互模式触发,待用户交互验证一次。
-- 安装:scripts/install.sh <project> --with-claude --with-agy;agy 走用户级 ~/.ctxpack/pack + ~/.gemini/config/hooks.json。
-- 下一步:Codex 接线(P2)、transcript 尾部注入(P3)、npm publish(需账号)。
+- ctxpack v0.3.0:Antigravity(agy)接入完成,接线已改为项目级 .agents/hooks.json(clone 即用)。
+- 真机:交互模式 PreInvocation 注入每轮触发;Stop closeout 待最终确认(closeout 现在会全量记录到 events.jsonl)。
+- freshness 守卫已在生产咬人一次:v0.3.0 改动 hook-matrix.md 后旧事实指针立即 STALE。

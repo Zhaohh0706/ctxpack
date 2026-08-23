@@ -1,8 +1,12 @@
 {
-  "SessionStart": [
-    { "matcher": "*", "hooks": [
-      { "name": "probe", "type": "command",
-        "command": "sh -c 'env | sort > /tmp/agy_env.txt; echo cwd=$PWD >> /tmp/agy_env.txt'" }
-    ]}
-  ]
+  "ctxpack-inject": {
+    "PreInvocation": [
+      { "type": "command", "command": "../.ctxpack/pack inject --cli agy", "timeout": 15 }
+    ]
+  },
+  "ctxpack-closeout": {
+    "Stop": [
+      { "type": "command", "command": "../.ctxpack/pack closeout --cli agy", "timeout": 15 }
+    ]
+  }
 }
