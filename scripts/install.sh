@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# ctxpack installer — wire SessionStart/closeout hooks into a project.
-# Usage: scripts/install.sh /path/to/project [--with-claude]
+# ctxpack installer — wire hooks into Gemini/Claude (project) and Antigravity CLI (user-level).
+# Usage: scripts/install.sh /path/to/project [--with-claude] [--with-agy]
 set -euo pipefail
 
-TARGET="${1:?usage: install.sh <project-dir> [--with-claude]}"
-WITH_CLAUDE=false
-[ "${2:-}" = "--with-claude" ] && WITH_CLAUDE=true
+TARGET="${1:?usage: install.sh <project-dir> [--with-claude] [--with-agy]}"
+WITH_CLAUDE=false WITH_AGY=false
+for arg in "${@:2}"; do
+  case "$arg" in
+    --with-claude) WITH_CLAUDE=true ;;
+    --with-agy)    WITH_AGY=true ;;
+  esac
+done
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 
 P="$(cd "$TARGET" && pwd)"
@@ -24,10 +29,15 @@ for f in AGENTS.md HANDOFF.md DECISIONS.md STATUS.md FACTS.md; do
 done
 [ -e "$P/GEMINI.md" ] || ln -s AGENTS.md "$P/GEMINI.md"
 
-python3 - "$P" "$WITH_CLAUDE" <<'PYEOF'
+if $WITH_AGY; then
+  mkdir -p "$HOME/.ctxpack"
+  cp "$SRC/bin/pack" "$HOME/.ctxpack/pack" && chmod +x "$HOME/.ctxpack/pack"
+fi
+
+python3 - "$P" "$WITH_CLAUDE" "$WITH_AGY" <<'PYEOF'
 import json, os, shutil, sys
 
-p, with_claude = sys.argv[1], sys.argv[2] == "true"
+p, with_claude, with_agy = sys.argv[1], sys.argv[2] == "true", sys.argv[3] == "true"
 
 def load(path):
     if os.path.exists(path):
@@ -72,10 +82,24 @@ if with_claude:
     save(os.path.join(p, ".claude/settings.json"), cl)
     print("    wired .claude/settings.json (SessionStart + Stop)")
 
-print("""    codex (manual, P2): merge .ctxpack/codex-snippet.json into ~/.codex/hooks.json""")
+if with_agy:
+    hp = os.path.expanduser("~/.gemini/config/hooks.json")
+    agy = load(hp)
+    def push_flat(name, event, command):
+        h = agy.setdefault(name, {})
+        lst = h.setdefault(event, [])
+        if not any(c.get("command") == command for c in lst):
+            lst.append({"type": "command", "command": command, "timeout": 15})
+    push_flat("ctxpack-inject", "PreInvocation", "~/.ctxpack/pack inject --cli agy")
+    push_flat("ctxpack-closeout", "Stop", "~/.ctxpack/pack closeout --cli agy")
+    save(hp, agy)
+    print("    wired ~/.gemini/config/hooks.json (PreInvocation + Stop, user-level)")
+
+codex_hint = ("merge .ctxpack/codex-snippet.json into ~/.codex/hooks.json (manual, P2)")
 open(os.path.join(p, ".ctxpack/codex-snippet.json"), "w").write(json.dumps({
     "SessionStart": [{"hooks": [{"type": "command",
         "command": "<project>/.ctxpack/pack inject --cli codex"}]}],
 }, indent=2))
+print(f"    {codex_hint}")
 print("done")
 PYEOF

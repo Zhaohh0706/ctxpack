@@ -1,0 +1,8 @@
+{
+  "SessionStart": [
+    { "matcher": "*", "hooks": [
+      { "name": "probe", "type": "command",
+        "command": "sh -c 'env | sort > /tmp/agy_env.txt; echo cwd=$PWD >> /tmp/agy_env.txt'" }
+    ]}
+  ]
+}

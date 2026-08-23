@@ -14,12 +14,13 @@ Subcommands:
 import argparse
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BUDGET_DEFAULT = 1200
 MAIL_MAX_BYTES = 2048
 CTXDIR = ".ctxpack"
@@ -32,8 +33,24 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+STDIN_DATA = {}
+
+
+def consume_stdin():
+    """Read hook payload once; agy runs hooks with cwd=<hooks.json dir>."""
+    global STDIN_DATA
+    try:
+        if not sys.stdin.isatty():
+            STDIN_DATA = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        STDIN_DATA = {}
+
+
 def find_root():
     d = os.getcwd()
+    paths = STDIN_DATA.get("workspacePaths") or []
+    if paths and os.path.isdir(paths[0]):
+        d = paths[0]
     while True:
         for marker in ("AGENTS.md", ".git"):
             if os.path.exists(os.path.join(d, marker)):
@@ -53,13 +70,20 @@ def read(path, root, limit=None):
     return t[:limit] if limit else t
 
 
+GIT_BIN = shutil.which("git") or "/usr/bin/git"
+
+
 def git(root, *args):
-    try:
-        r = subprocess.run(["git", "-C", root] + list(args),
-                           capture_output=True, text=True, timeout=10)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
+    for exe in (GIT_BIN, "/usr/bin/git", "/opt/homebrew/bin/git"):
+        try:
+            r = subprocess.run([exe, "-C", root] + list(args),
+                               capture_output=True, text=True, timeout=10,
+                               env={"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"})
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception:
+            continue
+    return None
 
 
 def est_tokens(s):
@@ -232,23 +256,24 @@ def render_context(header, kept):
 
 def cmd_inject(args):
     root = find_root()
-    try:
-        json.load(sys.stdin)
-    except Exception:
-        pass
     budget = args.budget or BUDGET_DEFAULT
     t0 = time.time()
     state = load_state(root)
     header, kept, used, dropped, why, counts = build_sections(root, budget, state)
-    env = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": render_context(header, kept),
-        },
-        "systemMessage": (f"ctxpack: {used}/{budget} tok · "
-                          f"{counts['fresh']} facts ({counts['stale']} stale) · "
-                          f"{counts['unread']} unread · {len(dropped)} dropped"),
-    }
+    sm = (f"ctxpack: {used}/{budget} tok · "
+          f"{counts['fresh']} facts ({counts['stale']} stale) · "
+          f"{counts['unread']} unread · {len(dropped)} dropped")
+    ctx_text = render_context(header, kept)
+    if args.cli == "agy":
+        env = {"injectSteps": [{"ephemeralMessage": ctx_text + "\n\n(" + sm + ")"}]}
+    else:
+        env = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": ctx_text,
+            },
+            "systemMessage": sm,
+        }
     hp = os.path.join(root, "docs/agent/HANDOFF.md")
     save_state(root, {
         **state,
@@ -267,10 +292,6 @@ def cmd_inject(args):
 
 def cmd_closeout(args):
     root = find_root()
-    try:
-        json.load(sys.stdin)
-    except Exception:
-        pass
     allow = lambda: json.dump({}, sys.stdout)
 
     dirty_raw = git(root, "status", "--porcelain")
@@ -298,6 +319,8 @@ def cmd_closeout(args):
     log_event(root, {"event": "closeout_block", "cli": args.cli, "dirty": len(dirty)})
     if args.cli == "gemini":
         json.dump({"decision": "deny", "reason": reason}, sys.stdout)
+    elif args.cli == "agy":
+        json.dump({"decision": "continue", "reason": reason}, sys.stdout)
     else:
         json.dump({"decision": "block", "reason": reason}, sys.stdout)
 
@@ -394,10 +417,10 @@ def main():
     ap = argparse.ArgumentParser(prog="pack")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p1 = sub.add_parser("inject")
-    p1.add_argument("--cli", required=True, choices=["gemini", "claude", "codex"])
+    p1.add_argument("--cli", required=True, choices=["gemini", "claude", "codex", "agy"])
     p1.add_argument("--budget", type=int, default=BUDGET_DEFAULT)
     p2 = sub.add_parser("closeout")
-    p2.add_argument("--cli", required=True, choices=["gemini", "claude", "codex"])
+    p2.add_argument("--cli", required=True, choices=["gemini", "claude", "codex", "agy"])
     sub.add_parser("facts-check")
     p4 = sub.add_parser("say")
     p4.add_argument("--from", dest="sender", required=True)
@@ -408,6 +431,7 @@ def main():
     p7.add_argument("--tail", type=int, default=20)
     sub.add_parser("version")
     args = ap.parse_args()
+    consume_stdin()
     {"inject": cmd_inject, "closeout": cmd_closeout, "facts-check": cmd_facts_check,
      "say": cmd_say, "mail-read": cmd_mail_read, "doctor": cmd_doctor,
      "log": cmd_log, "version": lambda a: print(f"ctxpack pack v{VERSION}")}[args.cmd](args)

@@ -108,6 +108,22 @@ echo '{}' | "$PACK" inject --cli claude --budget 100 | grep -q 'ctxpack v' && ok
 echo "== T15 doctor runs =="
 "$PACK" doctor >/dev/null 2>&1; [ $? -le 1 ] && ok "doctor exits cleanly" || bad "doctor crashed"
 
+echo "== T16 agy inject envelope: injectSteps/ephemeralMessage =="
+echo '{"workspacePaths":["$PWD"]}' > /dev/null
+OUTA=$(echo '{}' | "$PACK" inject --cli agy)
+echo "$OUTA" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+m=d["injectSteps"][0]["ephemeralMessage"]
+assert "[ctxpack" in m and "Handoff" in m
+' && ok "agy PreInvocation envelope valid" || bad "agy envelope"
+
+echo "== T17 agy closeout: decision continue =="
+echo y >> src/new2.py
+rm -f .ctxpack/blocked_once
+CA=$(echo '{}' | "$PACK" closeout --cli agy)
+echo "$CA" | grep -q '"continue"' && ok "agy Stop blocks with continue" || bad "agy no continue"
+rm -f .ctxpack/blocked_once
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 rm -rf "$TMP"

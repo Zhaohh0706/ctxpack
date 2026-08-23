@@ -2,7 +2,8 @@
 
 ## Current
 
-- 项目:ctxpack v0.2.0(跨 CLI 上下文编译器)。研究结论在 docs/research/。
-- 已完成:bin/pack 八个子命令(inject/closeout/facts-check/say/mail-read/doctor/log/version)、18 项测试全绿、Gemini+Claude 项目级 hook 接线、Gemini extension 发行脚手架(extension/)、npm 包脚手架(package.json)、同类项目对比(prior-art.md)。
-- 真机验证:hook 在 gemini CLI 实际触发(systemMessage 可见);模型调用被账号层级阻塞(IneligibleTierError),见 todo a8e502。
-- 下一步:用户修好任一家 CLI 登录后做最终真机注入确认;Codex hooks.json 全局接线(P2,需用户同意改 ~/.codx);ctx 式 transcript 尾部注入可作 P3 借鉴。
+- 项目:ctxpack v0.3.0(跨 CLI 上下文编译器)。研究结论在 docs/research/。
+- v0.3.0 新增:Antigravity CLI(agy)完整接入——PreInvocation 每轮注入 + Stop closeout,schema 经二进制内嵌文档+真机逆向验证(hook-matrix.md)。
+- 真机已验证:agy -p 下注入生效(模型可见 [ctxpack] 内容);Stop 仅交互模式触发,待用户交互验证一次。
+- 安装:scripts/install.sh <project> --with-claude --with-agy;agy 走用户级 ~/.ctxpack/pack + ~/.gemini/config/hooks.json。
+- 下一步:Codex 接线(P2)、transcript 尾部注入(P3)、npm publish(需账号)。
